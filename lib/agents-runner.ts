@@ -219,6 +219,8 @@ interface LiveTask {
 	nextId: number;
 	permissionBroker?: ParentStandingReviewPermissionBroker;
 	ipcClosed: boolean;
+	backgroundJobsEnabled: boolean;
+	settledJobIds: Set<string>;
 	acknowledgedIpcIds: Set<string>;
 	acknowledgedIpcOrder: string[];
 	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
@@ -626,7 +628,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, sawRunEvent: false, mutationStarts: new Map(), inFlightTools: new Map(), argumentProgress: new ToolArgumentProgress(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, childExitSignal: undefined, instructionsTransportDir, scratchDir, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [], stderrTail: "" };
+		const live: LiveTask = { child, sawRunEvent: false, mutationStarts: new Map(), inFlightTools: new Map(), argumentProgress: new ToolArgumentProgress(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, childExitSignal: undefined, instructionsTransportDir, scratchDir, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, backgroundJobsEnabled: env.GENTLE_PI_BACKGROUND_JOBS === "1" && request.agent.tools.includes("bash_background"), settledJobIds: new Set(), acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [], stderrTail: "" };
 		if (request.prepareResponseObservations) {
 			let ready = false;
 			live.observationPreparation = () => ready;
@@ -750,8 +752,32 @@ export class AgentRunner {
 		}
 		const task = this.store.get(id);
 		if (!task || live.terminal || isFinished(task.status) || task.parentSessionId === "") {
-			if (parsed.frame.kind === "notification") this.acknowledge(live, parsed.frame.id, false, "task is not a live owned recipient");
+			if (parsed.frame.kind !== "query") this.acknowledge(live, parsed.frame.id, false, "task is not a live owned recipient");
 			else this.sendQueryError(live, parsed.frame.id, "task is not a live owned recipient");
+			return;
+		}
+		if (parsed.frame.kind === "job") {
+			const frame = parsed.frame;
+			if (live.acknowledgedIpcIds.has(frame.id)) return;
+			if (!live.backgroundJobsEnabled) {
+				this.acknowledge(live, frame.id, false, "task has no background job capability");
+				return;
+			}
+			// Evidence only: no model delivery promise, liveness renewal or drain hold.
+			if (frame.phase === "settled" && !live.settledJobIds.has(frame.jobId)) {
+				if (live.settledJobIds.size >= 64) {
+					this.acknowledge(live, frame.id, false, "too many settled background jobs");
+					return;
+				}
+				try {
+					this.store.apply(id, { type: TASK_EVENT.NOTE, text: `background job settled: ${JSON.stringify({ jobId: frame.jobId, exitCode: frame.exitCode, outputTail: frame.outputTail })}` }, this.deps.now());
+					live.settledJobIds.add(frame.jobId);
+				} catch {
+					this.acknowledge(live, frame.id, false, "could not persist background job evidence");
+					return;
+				}
+			}
+			this.acknowledge(live, frame.id, true);
 			return;
 		}
 		if (parsed.frame.kind === "notification") {

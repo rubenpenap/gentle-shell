@@ -18,7 +18,14 @@ export interface QueryFrame {
 	message: string;
 }
 
-export type ChildFrame = NotificationFrame | QueryFrame;
+export const CHILD_JOB_MAX_IDS = 64;
+export const CHILD_JOB_TAIL_MAX_BYTES = 4096;
+export type JobPayload =
+	| { phase: "pending"; jobIds: string[] }
+	| { phase: "settled"; jobId: string; exitCode: number | null; outputTail: string }
+	| { phase: "drained" };
+export type JobFrame = { id: string; kind: "job" } & JobPayload;
+export type ChildFrame = NotificationFrame | QueryFrame | JobFrame;
 
 interface AckFrame {
 	id: string;
@@ -80,9 +87,34 @@ export function validChildMessage(value: unknown): value is string {
 	return boundedText(value, CHILD_MESSAGE_MAX_BYTES);
 }
 
+function validJobId(value: unknown): value is string {
+	if (typeof value !== "string" || !/^job-[1-9]\d{0,15}$/.test(value)) return false;
+	return Number.isSafeInteger(Number(value.slice(4)));
+}
+
+function parseJob(value: Record<string, unknown>, id: string): JobFrame | undefined {
+	if (!validChildId(id)) return undefined;
+	if (value.phase === "drained" && exact(value, ["id", "kind", "phase"])) return { id, kind: "job", phase: "drained" };
+	if (value.phase === "pending" && exact(value, ["id", "kind", "phase", "jobIds"]) && Array.isArray(value.jobIds)
+		&& value.jobIds.length <= CHILD_JOB_MAX_IDS && value.jobIds.every(validJobId) && new Set(value.jobIds).size === value.jobIds.length) {
+		return { id, kind: "job", phase: "pending", jobIds: [...value.jobIds] };
+	}
+	// Windows native process status is an unsigned DWORD; POSIX statuses fit too.
+	if (value.phase === "settled" && exact(value, ["id", "kind", "phase", "jobId", "exitCode", "outputTail"])
+		&& validJobId(value.jobId) && (value.exitCode === null || typeof value.exitCode === "number" && Number.isInteger(value.exitCode) && value.exitCode >= 0 && value.exitCode <= 0xFFFFFFFF)
+		&& boundedText(value.outputTail, CHILD_JOB_TAIL_MAX_BYTES)) {
+		return { id, kind: "job", phase: "settled", jobId: value.jobId, exitCode: typeof value.exitCode === "number" ? value.exitCode : null, outputTail: value.outputTail };
+	}
+	return undefined;
+}
+
 export function parseChildFrame(value: unknown): { frame?: ChildFrame; id?: string; error?: string } {
 	if (!record(value)) return { error: "invalid child IPC frame" };
 	const id = validChildQueryId(value.id) || validChildId(value.id) ? value.id : undefined;
+	if (value.kind === "job") {
+		const frame = id === undefined ? undefined : parseJob(value, id);
+		return frame ? { frame } : { ...(id === undefined ? {} : { id }), error: "invalid child IPC frame" };
+	}
 	if (!exact(value, ["id", "kind", "message"])) return { ...(id === undefined ? {} : { id }), error: "invalid child IPC frame" };
 	if (id === undefined) return { error: "invalid child IPC correlation" };
 	if (value.kind !== "notification" && value.kind !== "query") return { id, error: "unsupported child IPC kind" };
@@ -135,6 +167,16 @@ export class ChildMessenger {
 		return this.send(this.pending, `n${++this.nextId}`, "notification", message, CHILD_MESSAGE_TIMEOUT_MS, "parent-message admission timed out");
 	}
 
+	// Reuse this messenger instance: jobs and notifications share ACK correlations.
+	job(payload: JobPayload): Promise<void> {
+		if (!this.available()) return Promise.reject(new Error("parent notification channel closed"));
+		const frame = parseChildFrame({ ...payload, id: "n1", kind: "job" }).frame;
+		if (!frame || frame.kind !== "job") return Promise.reject(new Error("invalid child IPC frame"));
+		if (this.pending.size >= CHILD_MESSAGE_MAX_INFLIGHT) return Promise.reject(new Error("too many pending parent-message admissions"));
+		if (this.nextId >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error("parent-message correlation exhausted"));
+		return this.send(this.pending, `n${++this.nextId}`, "job", "", CHILD_MESSAGE_TIMEOUT_MS, "parent-message admission timed out", frame);
+	}
+
 	query(message: string): Promise<string> {
 		if (!this.available()) return Promise.reject(new Error("parent notification channel closed"));
 		if (!validChildMessage(message)) return Promise.reject(new Error("query is not well-formed UTF-16 or exceeds 8KiB"));
@@ -156,12 +198,12 @@ export class ChildMessenger {
 		return false;
 	}
 
-	private send<T>(pending: Map<string, Pending<T>>, id: string, kind: "notification" | "query", message: string, timeout: number, timeoutMessage: string): Promise<T> {
+	private send<T>(pending: Map<string, Pending<T>>, id: string, kind: "notification" | "query" | "job", message: string, timeout: number, timeoutMessage: string, job?: JobFrame): Promise<T> {
 		return new Promise((resolve, reject) => {
 			const settle = (error?: Error, reply?: T) => this.settle(pending, id, error, reply);
 			const cancel = this.schedule(() => settle(new Error(timeoutMessage)), timeout);
 			pending.set(id, { resolve, reject, cancel });
-			try { this.endpoint.send({ id, kind, message }, (error) => { if (error) settle(error); }); }
+			try { this.endpoint.send(job ? { ...job, id } : { id, kind, message }, (error) => { if (error) settle(error); }); }
 			catch (error) { settle(error instanceof Error ? error : new Error(String(error))); }
 		});
 	}

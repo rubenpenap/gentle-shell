@@ -34,7 +34,7 @@ interface Harness {
 	advance(ms: number): void;
 }
 
-function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boolean; process?: RunnerDeps["process"]; pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; toolStallTimeoutMs?: number; cleanupTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; exitOnStdinEnd?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
+function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boolean; process?: RunnerDeps["process"]; pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; toolStallTimeoutMs?: number; cleanupTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; exitOnStdinEnd?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onQuery?: RunnerHooks["onQuery"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -80,6 +80,7 @@ function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boo
 		},
 		onFinish: (task, observations) => { finishes.push(task.id); options.onFinish?.(task, observations); },
 		onNotification: options.onNotification,
+		onQuery: options.onQuery,
 		onSuccessfulMutation: options.onSuccessfulMutation,
 	});
 	return { store, runner, children, timers, asks, finishes, spawnOptions, advance(ms) {
@@ -94,6 +95,76 @@ function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boo
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("job evidence requires explicit launch capability and persists once before ACK", async (t) => {
+	const root = fs.mkdtempSync(join(tmpdir(), "job-ipc-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	fs.writeFileSync(join(root, "background-subagents.json"), JSON.stringify({ schema: "gentle-pi.background-subagents/v1", policy: "on" }));
+	for (const enabled of [false, true]) {
+		const h = harness({ onNotification: () => { throw new Error("not a notification"); } });
+		const task = h.runner.run(request({ cwd: root, env: { GENTLE_PI_CONFIG_HOME: root }, agent: { ...explorer, tools: enabled ? ["bash_background"] : ["read"] } }));
+		await tick();
+		const child = h.children[0];
+		const before = structuredClone(h.store.get(task.id));
+		const thread = structuredClone(h.store.thread(task.id));
+		const frame = { id: "n1", kind: "job", phase: "settled", jobId: "job-1", exitCode: 7, outputTail: "stdout-marker\nstderr-marker" };
+		let observedPersisted = false;
+		const originalSend = child.child.send!;
+		child.child.send = (ack, callback) => {
+			if (enabled && ack.id === "n1" && ack.accepted === true) {
+				assert.ok(h.store.thread(task.id).items.some(item => item.kind === THREAD_ITEM.NOTE && item.text.includes("stdout-marker")));
+				observedPersisted = true;
+			}
+			return originalSend(ack, callback);
+		};
+		child.message(frame);
+		assert.equal(observedPersisted, enabled);
+		assert.equal(child.sent[0]?.accepted, enabled);
+		if (enabled) {
+			assert.deepEqual(h.store.thread(task.id).items.filter(item => item.kind === THREAD_ITEM.NOTE), [{ kind: THREAD_ITEM.NOTE, text: `background job settled: ${JSON.stringify({ jobId: "job-1", exitCode: 7, outputTail: frame.outputTail })}` }]);
+			child.message({ ...frame, id: "n2" });
+			assert.equal(h.store.thread(task.id).items.filter(item => item.kind === THREAD_ITEM.NOTE).length, 1);
+			for (let i = 2; i <= 64; i++) child.message({ ...frame, id: `n${i + 2}`, jobId: `job-${i}` });
+			const retained = structuredClone(h.store.thread(task.id));
+			const retainedTask = structuredClone(h.store.get(task.id));
+			child.message({ ...frame, id: "n100", jobId: "job-65" });
+			assert.deepEqual(child.sent.at(-1), { id: "n100", kind: "ack", accepted: false, error: "too many settled background jobs" });
+			assert.deepEqual(h.store.thread(task.id), retained);
+			assert.deepEqual(h.store.get(task.id), retainedTask);
+			child.message({ ...frame, id: "n101" });
+			assert.deepEqual(child.sent.at(-1), { id: "n101", kind: "ack", accepted: true });
+			assert.deepEqual(h.store.thread(task.id), retained);
+		} else {
+			assert.deepEqual(h.store.thread(task.id), thread);
+			assert.deepEqual(h.store.get(task.id), before);
+		}
+		const stable = structuredClone(h.store.thread(task.id));
+		const counters = [task.turns, task.toolCalls, task.tokens, task.cost];
+		child.message({ ...frame, id: "n3", outputTail: "x".repeat(4097) });
+		assert.deepEqual(h.store.thread(task.id), stable);
+		assert.deepEqual([task.turns, task.toolCalls, task.tokens, task.cost], counters);
+		h.runner.cancel(task.id);
+	}
+});
+
+test("queries preserve admission and replies with job frames interleaved", async () => {
+	const queries: string[] = [];
+	const h = harness({ onQuery: (_task, id, message) => { queries.push(`${id}:${message}`); } });
+	const task = h.runner.run(request());
+	await tick();
+	const child = h.children[0];
+	child.message({ id: "q1", kind: "query", message: "question" });
+	child.message({ id: "n1", kind: "job", phase: "drained" });
+	assert.deepEqual(await h.runner.waitForQuery(task.id), { taskId: task.id, requestId: "q1", message: "question" });
+	assert.equal(await h.runner.reply(task.id, "q1", "answer", "s1"), true);
+	assert.deepEqual(child.sent.at(-1), { id: "q1", kind: "reply", message: "answer" });
+	for (let i = 2; i <= 5; i++) child.message({ id: `q${i}`, kind: "query", message: "pending" });
+	child.message({ id: "n2", kind: "job", phase: "pending", jobIds: [] });
+	child.message({ id: "q6", kind: "query", message: "overflow" });
+	assert.deepEqual(child.sent.at(-1), { id: "q6", kind: "reply", error: "too many pending parent queries" });
+	assert.equal(queries.length, 5);
+	h.runner.cancel(task.id);
+});
 
 for (const mode of [AGENT_MODE.TASK, AGENT_MODE.BACKGROUND]) {
 	for (const policy of [undefined, "off", "malformed"] as const) {
