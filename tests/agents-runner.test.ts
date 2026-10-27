@@ -176,6 +176,31 @@ test("background capability admission refreshes project policy when queued work 
 	assert.equal(readFileSync(file, "utf8"), raw);
 });
 
+for (const policy of [undefined, "off", "on"] as const) {
+	test(`child background flag is derived at dispatch, not inherited: ${policy ?? "default"}`, async (t) => {
+		const root = fs.mkdtempSync(join(tmpdir(), "job-flag-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const h = harness({ maxConcurrency: 1 });
+		const env = { GENTLE_PI_CONFIG_HOME: join(root, "config"), GENTLE_PI_BACKGROUND_JOBS: "1", ...(policy ? { GENTLE_PI_BACKGROUND_SUBAGENTS: policy } : {}) };
+		const first = h.runner.run(request({ cwd: root, env }));
+		await tick();
+		assert.equal(h.spawnOptions[0].env.GENTLE_PI_BACKGROUND_JOBS, policy === "on" ? "1" : undefined);
+		assert.equal(env.GENTLE_PI_BACKGROUND_JOBS, "1");
+		const queued = h.runner.run(request({ cwd: root, env }));
+		const dir = join(root, ".pi", "gentle-ai");
+		fs.mkdirSync(dir, { recursive: true });
+		const raw = JSON.stringify({ schema: "gentle-pi.background-subagents/v1", policy: policy === "on" ? "off" : "on" });
+		fs.writeFileSync(join(dir, "background-subagents.json"), raw);
+		h.runner.cancel(first.id);
+		await tick();
+		assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.RUNNING);
+		assert.equal(h.spawnOptions[1].env.GENTLE_PI_BACKGROUND_JOBS, policy === "on" ? undefined : "1");
+		assert.equal(fs.readFileSync(join(dir, "background-subagents.json"), "utf8"), raw);
+		h.runner.cancel(queued.id);
+		await tick();
+	});
+}
+
 const FOUR_MIN_MS = 4 * 60_000;
 
 function argumentUpdate(type: string, fields: Record<string, unknown> = {}): Record<string, unknown> {
@@ -1248,7 +1273,9 @@ test("AgentRunner fails if the child exits after agent_end but before agent_sett
 	assert.equal(store.get(task.id)?.result, "partial answer", "the final observed answer remains available for diagnostics");
 });
 
-for (const [platform, detached] of [["win32", false], ["linux", true]] as const) test(`AgentRunner selects detached=${detached} for ${platform} without changing the launch contract`, async () => {
+for (const [platform, detached] of [["win32", false], ["linux", true]] as const) test(`AgentRunner selects detached=${detached} for ${platform} without changing the launch contract`, async (t) => {
+	const config = fs.mkdtempSync(join(tmpdir(), "policy-off-"));
+	t.after(() => fs.rmSync(config, { recursive: true, force: true }));
 	const store = new TaskStore();
 	const launches: Array<{ command: string; args: string[]; options: Parameters<RunnerDeps["spawn"]>[2] }> = [];
 	const child = fakeChild();
@@ -1262,7 +1289,7 @@ for (const [platform, detached] of [["win32", false], ["linux", true]] as const)
 		pi: { command: "pi-fixture", args: ["--from-host"] },
 		process: { platform, kill: () => {} },
 	}, { askUser: async () => ({ cancelled: true }) });
-	const task = runner.run(request({ env: { PATH: "/fixture", KEEP: "yes" } }));
+	const task = runner.run(request({ env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_CONFIG_HOME: config } }));
 	await tick();
 	const ownedIpc = launches[0]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC;
 	assert.match(ownedIpc ?? "", /^\d+-[a-z0-9]+$/, "the runner creates an opaque owned-IPC marker");
@@ -1272,7 +1299,7 @@ for (const [platform, detached] of [["win32", false], ["linux", true]] as const)
 	assert.deepEqual(launches, [{
 		command: "pi-fixture",
 		args: ["--from-host", "--mode", "rpc", "--session-dir", "/sessions", "--model", "openai-codex/gpt-5.6-terra:high", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."],
-		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc, [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv }, detached, windowsHide: true, stdio: ["pipe", "pipe", "pipe", "ipc"] },
+		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_CONFIG_HOME: config, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc, [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv }, detached, windowsHide: true, stdio: ["pipe", "pipe", "pipe", "ipc"] },
 	}]);
 	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "platform checked" }], stopReason: "stop" }] });
 	child.emit({ type: "agent_settled" });
@@ -1348,16 +1375,18 @@ test("AgentRunner primary IPC cleanup respects native connection state", async (
 	}
 });
 
-test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4", async () => {
+test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4", async (t) => {
+	const config = fs.mkdtempSync(join(tmpdir(), "policy-off-"));
+	t.after(() => fs.rmSync(config, { recursive: true, force: true }));
 	const { runner, children, spawnOptions } = harness();
-	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));
+	const task = runner.run(request({ env: { GENTLE_PI_CONFIG_HOME: config }, authorizeParentStandingReviewPermission: () => true }));
 	await tick();
 	const launch = spawnOptions[0];
 	const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
 	const scratch = launch?.env.TMPDIR;
 	const scratchEnv = process.platform === "win32" ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : { TMPDIR: scratch };
-	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3", [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv });
+	assert.deepEqual(launch?.env, { GENTLE_PI_CONFIG_HOME: config, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3", [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv });
 	assert.match(basename(launch?.env.TMPDIR ?? ""), /^ga[A-Za-z0-9]{6}$/);
 	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"]);
 	assert.equal(launch?.stdio?.length, 5);

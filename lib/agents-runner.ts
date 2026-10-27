@@ -557,8 +557,11 @@ export class AgentRunner {
 		delete env.GENTLE_PI_SDD_REMEDIATION_PLAN;
 		delete env.GENTLE_PI_RESEARCH_SELECTION;
 		const tools = requestedTools(request);
+		const policy = resolveBackgroundSubagentsPolicy(request.cwd, { env: request.env, gentlePiConfigHome: gentlePiConfigHome(request.env) });
+		// Admission belongs to the parent at dispatch, never the child's worktree.
+		delete env.GENTLE_PI_BACKGROUND_JOBS;
+		if (policy.policy === "on") env.GENTLE_PI_BACKGROUND_JOBS = "1";
 		if (request.agent.tools.includes("bash_background")) {
-			const policy = resolveBackgroundSubagentsPolicy(request.cwd, { env: request.env, gentlePiConfigHome: gentlePiConfigHome(request.env) });
 			if (policy.policy === "off") {
 				const file = policy.source === "global_file" ? policy.globalFile : policy.projectFile;
 				this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
