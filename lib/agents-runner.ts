@@ -607,7 +607,10 @@ export class AgentRunner {
 			try { chmodSync(scratchDir, DIR_MODE); } catch { /* best effort */ }
 			env.TMPDIR = scratchDir;
 			if (this.processControl.platform === "win32") { env.TMP = scratchDir; env.TEMP = scratchDir; }
-		} catch { scratchDir = undefined; }
+		} catch {
+			scratchDir = undefined;
+			delete env.GENTLE_PI_BACKGROUND_JOBS;
+		}
 		let child: ChildLike;
 		try {
 			const pi = this.deps.resolvePi?.() ?? this.deps.pi;
