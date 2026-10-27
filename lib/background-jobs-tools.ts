@@ -75,6 +75,8 @@ export const jobDetails = (job: JobRecord, event?: "events" | MonitorStopReason)
 
 export interface BackgroundJobToolsOptions {
 	registry: JobRegistry;
+	/** Child jobs have no post-agent-settlement delivery guarantee yet. */
+	childOnly?: boolean;
 	/** The session the tool call runs in; jobs belong to it. */
 	sessionId(ctx: ExtensionContext): string;
 	now(): number;
@@ -95,7 +97,9 @@ export function registerBackgroundJobTools(pi: ExtensionAPI, options: Background
 		name: BASH_BACKGROUND_TOOL,
 		label: "Bash (background)",
 		description: [
-			"Run a shell command in the background and return a job id at once. You are notified once, automatically, when it exits (exit code, last output lines, output file); do not poll, sleep, or delegate a subagent to wait.",
+			options.childOnly
+				? "Run a shell command in the background and return a job id at once. Completion reaches the parent only while this child remains alive; delivery after agent settlement is not supported yet. Do not use this as a durable wait across task completion."
+				: "Run a shell command in the background and return a job id at once. You are notified once, automatically, when it exits (exit code, last output lines, output file); do not poll, sleep, or delegate a subagent to wait.",
 			"Use synchronous bash for local, finite, deterministic checks reasonably expected to finish within 30 seconds, with an explicit timeout <= 30 seconds (30 included). Use bash_background for longer or unknown duration, external waits, CI, builds, and servers, including deploys and long tests. Report a timeout as failure; never automatically retry, restart, or migrate it to background. Preserve RED/GREEN and public-check exit codes, stdout, and stderr; do not defer or batch Engram bugfix saves and session summaries or bypass RDD. This is guidance, not a performance guarantee.",
 			"Put the wait condition inside the command so its exit is the event, e.g. `gh run watch <run-id> --exit-status` or `until curl -sf localhost:3000/health; do sleep 1; done`.",
 			`Output goes to a file you can read with the read tool. Stop a job with job_stop; list jobs with job_list. At most ${MAX_RUNNING_JOBS} run at once.`,
@@ -115,7 +119,7 @@ export function registerBackgroundJobTools(pi: ExtensionAPI, options: Background
 			const job = registry.start({ command: input.command, cwd: ctx.cwd, ownerSessionId: options.sessionId(ctx), label: typeof input.label === "string" ? input.label : undefined });
 			options.onChange?.();
 			return text(
-				`Started background job ${quoted(job)}.\nOutput: ${job.outputPath}\nYou will be notified once when it exits; keep working or end your turn. Stop it with job_stop.`,
+				`Started background job ${quoted(job)}.\nOutput: ${job.outputPath}\n${options.childOnly ? "Completion can reach the parent only while this child is alive; no post-settlement delivery guarantee." : "You will be notified once when it exits; keep working or end your turn."} Stop it with job_stop.`,
 				jobDetails(job),
 			);
 		},

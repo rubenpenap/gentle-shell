@@ -67,6 +67,7 @@ import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
 import { allowedEditSurfaces, inheritAllowedEditSurfaces, isBoundedWriter, isDevelopmentSurface, isGenericBoundedWriter, prepareBoundSessionRepository, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sessionRepositoryAuthority } from "../lib/bounded-writer-admission.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
+import { registerChildBackgroundJobs } from "../lib/child-background-jobs.ts";
 import { publishTaskStatusChanges } from "../lib/notification-events.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
@@ -349,8 +350,7 @@ function registerMissingToolsCheck(pi: ExtensionAPI, env: NodeJS.ProcessEnv): vo
 	});
 }
 
-function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint): void {
-	const messenger = new ChildMessenger(ipc);
+function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint, messenger = new ChildMessenger(ipc)): void {
 	pi.registerTool({
 		name: "subagent_parent_message",
 		label: "Agent parent message",
@@ -509,7 +509,15 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			pi.on("tool_call", () => ({ block: true, reason: "Retired SDD child launch is not supported." }));
 			return;
 		}
-		if (childIpc) registerChildMessaging(pi, childIpc);
+		if (childIpc) {
+			const messenger = new ChildMessenger(childIpc);
+			registerChildMessaging(pi, childIpc, messenger);
+			registerChildBackgroundJobs(pi, {
+				env, ipc: childIpc, messenger,
+				agentHome: () => resolveAgentHomeDirectory({ env, home: overrides.home ?? os.homedir(), agentHome: overrides.agentHome, homeOverridden: overrides.home !== undefined }),
+				shell: overrides.jobShell,
+			});
+		}
 		registerMissingToolsCheck(pi, env);
 		return;
 	}
