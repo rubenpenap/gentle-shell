@@ -5,6 +5,49 @@ import { join } from "node:path";
 import test from "node:test";
 import { CHILD_MESSAGE_MAX_BYTES, ChildMessenger, parseChildFrame } from "../lib/agents-messaging.ts";
 
+test("job frames have strict bounded phase schemas", () => {
+	const settled = { id: "n1", kind: "job", phase: "settled", jobId: "job-1", exitCode: 7, outputTail: "💡".repeat(1024) };
+	for (const frame of [settled, { ...settled, exitCode: null }, { ...settled, exitCode: 0 }, { ...settled, exitCode: 255 }, { ...settled, exitCode: 4294967295 }, { id: "n2", kind: "job", phase: "pending", jobIds: ["job-1", "job-9007199254740991"] }, { id: "n3", kind: "job", phase: "drained" }]) assert.deepEqual(parseChildFrame(frame).frame, frame);
+	for (const frame of [
+		{ ...settled, extra: true }, { ...settled, id: "q1" }, { ...settled, phase: "unknown" },
+		...[-1, 4294967296, Infinity, NaN, 1.5, "7", undefined].map(exitCode => ({ ...settled, exitCode })),
+		...["job-0", "job-01", "job-9007199254740992", 1, undefined].map(jobId => ({ ...settled, jobId })),
+		...["x".repeat(4097), "💡".repeat(1025), "\uD800", "\uDC00", 1, undefined].map(outputTail => ({ ...settled, outputTail })),
+		{ id: "n1", kind: "job", phase: "pending" },
+		...[null, ["job-1", "job-1"], Array.from({ length: 65 }, (_, i) => `job-${i + 1}`), ["job-0"]].map(jobIds => ({ id: "n1", kind: "job", phase: "pending", jobIds })),
+		{ id: "n1", kind: "job", phase: "drained", jobIds: [] },
+	]) assert.ok(parseChildFrame(frame).error, JSON.stringify(frame).slice(0, 100));
+});
+
+test("job admissions share notification sequence, limits, timeout and disconnect", async () => {
+	const listeners = new Map<string, (...args: unknown[]) => void>();
+	const frames: unknown[] = [];
+	const timers: Array<() => void> = [];
+	const messenger = new ChildMessenger({ send: frame => { frames.push(frame); return true; }, on: (event, fn) => listeners.set(event, fn) }, fn => { timers.push(fn); return () => {}; });
+	const first = messenger.notify("preserved");
+	listeners.get("message")!({ id: "n1", kind: "ack", accepted: true });
+	await first;
+	const job = messenger.job({ phase: "drained" });
+	assert.deepEqual(frames.at(-1), { id: "n2", kind: "job", phase: "drained" });
+	listeners.get("message")!({ id: "n2", kind: "ack", accepted: true });
+	await job;
+	const query = messenger.query("preserved query");
+	assert.deepEqual(frames.at(-1), { id: "q1", kind: "query", message: "preserved query" });
+	const interleaved = messenger.job({ phase: "drained" });
+	listeners.get("message")!({ id: "n3", kind: "ack", accepted: true });
+	await interleaved;
+	listeners.get("message")!({ id: "q1", kind: "reply", message: "answer" });
+	assert.equal(await query, "answer");
+	const timeout = messenger.job({ phase: "pending", jobIds: [] });
+	timers.at(-1)!();
+	await assert.rejects(timeout, /timed out/);
+	const pending = Array.from({ length: 8 }, () => messenger.job({ phase: "drained" }));
+	await assert.rejects(messenger.job({ phase: "drained" }), /too many/);
+	listeners.get("disconnect")!();
+	assert.ok((await Promise.allSettled(pending)).every(result => result.status === "rejected"));
+	await assert.rejects(messenger.job({ phase: "drained" }), /closed/);
+});
+
 test("notification and query frames admit only bounded exact schemas", () => {
 	assert.deepEqual(parseChildFrame({ id: "n1", kind: "notification", message: "💡\nready" }).frame, { id: "n1", kind: "notification", message: "💡\nready" });
 	assert.deepEqual(parseChildFrame({ id: "q1", kind: "query", message: "💡\nready" }).frame, { id: "q1", kind: "query", message: "💡\nready" });
